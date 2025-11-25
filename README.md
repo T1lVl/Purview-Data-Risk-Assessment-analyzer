@@ -2,40 +2,17 @@
 A python script that will automatically label your sharepoint sites with Low, Medium or High for oversharing. It looks for keywords, sensitive info vs how many people are accessing the information etc.
 
 import pandas as pd
+import numpy as np
 
 # ============================================================
 #  CONFIGURATION
-#  (change INPUT_FILE / OUTPUT_FILE / thresholds as you like)
 # ============================================================
 
 INPUT_FILE = "Report_DataOversharingworkshop.xlsx"
 OUTPUT_FILE = "Purview_DataRisk_scored.xlsx"
 SHEET_NAME = "Data risk assessment results"
 
-# --- Risk thresholds (tweak these per customer) --------------
-
-SENSITIVE_HIGH_PCT = 0.30      # 30%+ sensitive = high
-SENSITIVE_MED_PCT = 0.10       # 10–29% sensitive = medium
-SENSITIVE_ITEM_HIGH = 50       # 50+ sensitive items = high
-SENSITIVE_ITEM_MED = 10        # 10–49 sensitive items = medium
-
-UNIQUE_USERS_MED = 5           # 5+ unique users = collaboration signal
-TIMES_ACCESSED_MED = 10        # 10+ touches = medium activity
-
-UNSCANNED_HIGH_PCT = 0.40      # >40% unscanned = blind-spot risk
-
-# ------------------------------------------------------------------
-# Department / function keywords
-# These are intentionally broad and cover:
-# - Commercial (Exec, HR, Finance, Legal, Sales, R&D, etc.)
-# - Education (Student records, SIS, Registrar, Financial aid, etc.)
-# - Healthcare (PHI, clinical, EHR, billing, etc.)
-# - Government (tax, licensing, police, courts, welfare, etc.)
-#
-# "High" = locations that *usually* hold highly sensitive data
-# "Medium" = important but not always high-risk by default
-# ------------------------------------------------------------------
-
+# Department / function keywords (same as before)
 HIGH_DEPT_KEYWORDS = [
     # ---- Executive / leadership ----
     "ceo", "cfo", "coo", "cio", "cto", "ciso",
@@ -123,45 +100,51 @@ MED_DEPT_KEYWORDS = [
 # ============================================================
 
 def load_assessment(path: str) -> pd.DataFrame:
-    """
-    Load the Purview DSPM export and locate the real header row.
-    We look for the row whose first column is 'Data source ID'.
-    """
+    """Load the Purview DSPM export and locate the real header row."""
     raw = pd.read_excel(path, sheet_name=SHEET_NAME, header=None)
-
     header_row_index = raw.index[raw.iloc[:, 0] == "Data source ID"][0]
     headers = raw.iloc[header_row_index]
     df = raw.iloc[header_row_index + 1 :].copy()
     df.columns = headers
-
     return df.reset_index(drop=True)
 
 
 def get_dept_hint(value: str) -> str:
-    """
-    Inspect a string (site path or name) and return:
-    - "High" if it contains any high-risk keywords (HR, exec, finance, etc.)
-    - "Medium" if it contains any medium-risk keywords
-    - "None" otherwise
-    """
+    """Return High/Medium/None based on presence of department keywords."""
     if not isinstance(value, str):
         return "None"
-
     text = value.lower()
-
     for kw in HIGH_DEPT_KEYWORDS:
         if kw and kw.lower() in text:
             return "High"
-
     for kw in MED_DEPT_KEYWORDS:
         if kw and kw.lower() in text:
             return "Medium"
-
     return "None"
 
 
-def add_calculated_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize numeric fields and compute percentages / flags / dept hints."""
+def compute_thresholds(series: pd.Series, default_low: float, default_high: float):
+    """
+    Compute median and 75th percentile thresholds for a metric.
+    Fallback to defaults if there isn't enough data.
+    """
+    s = series.replace([np.inf, -np.inf], np.nan).dropna()
+    s = s[s > 0]  # ignore zeros, they’re not “real” activity/sensitivity
+    if len(s) == 0:
+        return default_low, default_high
+
+    med = s.quantile(0.5)
+    hi = s.quantile(0.75)
+
+    # Ensure hi >= med, with some basic sanity
+    if hi < med:
+        hi = med
+
+    return float(med), float(hi)
+
+
+def add_calculated_columns_and_thresholds(df: pd.DataFrame):
+    """Compute derived metrics and dynamic thresholds."""
     numeric_cols = [
         "Total items",
         "Total items accessed",
@@ -171,38 +154,34 @@ def add_calculated_columns(df: pd.DataFrame) -> pd.DataFrame:
         "Times users accessed items",
         "Unique users accessing items",
     ]
-
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
         else:
             df[col] = 0
 
-    # Percentage of scanned items that are sensitive
+    # Percent sensitive
     df["SensitivePct"] = df["Total sensitive items"] / df["Total scanned items"].replace(0, pd.NA)
 
-    # Percentage of content that is unscanned
+    # Percent unscanned
     total_scanned = df["Total scanned items"]
     total_unscanned = df["Total unscanned data"]
     df["UnscannedPct"] = total_unscanned / (total_scanned + total_unscanned).replace(0, pd.NA)
 
-    # External / broad sharing flag based on "Items shared with"
-    # (Everyone/Anyone/External/Public considered risky)
+    # External sharing flag
     df["ExternalSharing"] = df["Items shared with"].astype(str).str.contains(
         "everyone|anyone|external|public", case=False, na=False
     )
 
-    # ---- Department hint based on Data source ID and optional name ----
+    # DeptHint from ID + optional name
     src_id_col = "Data source ID"
     name_col = "Data source name" if "Data source name" in df.columns else None
 
     def compute_dept(row):
         id_val = str(row.get(src_id_col, ""))
         name_val = str(row.get(name_col, "")) if name_col else ""
-
         hint_id = get_dept_hint(id_val)
         hint_name = get_dept_hint(name_val)
-
         if "High" in (hint_id, hint_name):
             return "High"
         if "Medium" in (hint_id, hint_name):
@@ -211,18 +190,34 @@ def add_calculated_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     df["DeptHint"] = df.apply(compute_dept, axis=1)
 
-    return df
+    # ---- Dynamic thresholds (range-based) -------------------
+    thresholds = {}
+
+    thresholds["sens_med"], thresholds["sens_high"] = compute_thresholds(
+        df["SensitivePct"], default_low=0.05, default_high=0.20
+    )
+    thresholds["sens_items_med"], thresholds["sens_items_high"] = compute_thresholds(
+        df["Total sensitive items"], default_low=5, default_high=25
+    )
+    thresholds["users_med"], thresholds["users_high"] = compute_thresholds(
+        df["Unique users accessing items"], default_low=2, default_high=10
+    )
+    thresholds["access_med"], thresholds["access_high"] = compute_thresholds(
+        df["Times users accessed items"], default_low=5, default_high=25
+    )
+    thresholds["unscanned_med"], thresholds["unscanned_high"] = compute_thresholds(
+        df["UnscannedPct"], default_low=0.10, default_high=0.40
+    )
+
+    return df, thresholds
 
 
-def classify_row(row) -> str:
+def classify_row(row, thresholds) -> str:
     """
-    Classify a data source as High / Medium / Low / None
-    using a scoring model + department hints.
-
-    Notes:
-    - Completely empty locations (no items, no scans, no sensitive items) → "None".
-    - Everything else starts at "Low". If no conditions are hit, result stays "Low"
-      (this replaced the old 'Unknown' state).
+    Classify a data source as High / Medium / Low / None using:
+    - Dynamic quantile-based thresholds
+    - DeptHint bumps
+    - External sharing
     """
 
     pct = row["SensitivePct"]
@@ -235,54 +230,61 @@ def classify_row(row) -> str:
     scanned = row["Total scanned items"]
     dept_hint = row["DeptHint"]
 
-    # --- Empty locations are None ---
+    # Completely empty = None
     if total_items == 0 and scanned == 0 and total_sensitive == 0:
         return "None"
 
-    # Start with Low as a baseline if there's any content
-    score = 0   # 0 = Low, 1 = Medium, 2 = High
+    # baseline: if there is content at all, start as Low
+    score = 0  # 0 = Low, 1 = Medium, 2 = High
 
-    # --- High risk conditions ---
-    high_cond_1 = (
-        (pd.notna(pct) and pct >= SENSITIVE_HIGH_PCT)
-        or (total_sensitive >= SENSITIVE_ITEM_HIGH)
-    ) and (unique_users >= UNIQUE_USERS_MED or times_accessed >= TIMES_ACCESSED_MED)
+    sens_med = thresholds["sens_med"]
+    sens_high = thresholds["sens_high"]
+    sens_items_med = thresholds["sens_items_med"]
+    sens_items_high = thresholds["sens_items_high"]
+    users_med = thresholds["users_med"]
+    users_high = thresholds["users_high"]
+    access_med = thresholds["access_med"]
+    access_high = thresholds["access_high"]
+    unscan_med = thresholds["unscanned_med"]
+    unscan_high = thresholds["unscanned_high"]
 
-    high_cond_2 = (
-        (pd.notna(pct) and pct >= SENSITIVE_MED_PCT)
-        or (total_sensitive >= SENSITIVE_ITEM_MED)
-    ) and external
+    # Normalize NaN to 0 for comparison
+    pct_val = float(pct) if pd.notna(pct) else 0.0
+    unscan_val = float(unscanned_pct) if pd.notna(unscanned_pct) else 0.0
 
-    high_cond_3 = (
-        pd.notna(unscanned_pct)
-        and unscanned_pct >= UNSCANNED_HIGH_PCT
-        and total_items > 0
-    )
+    # ---------------- HIGH conditions ----------------
+    high_sens = (pct_val >= sens_high) or (total_sensitive >= sens_items_high)
+    high_exposed = (unique_users >= users_med) or (times_accessed >= access_med)
+    high_unscanned = (unscan_val >= unscan_high) and (total_items > 0)
 
-    if high_cond_1 or high_cond_2 or high_cond_3:
+    # 1) Very sensitive + some exposure
+    if high_sens and high_exposed:
         score = max(score, 2)
 
-    # --- Medium risk conditions ---
-    med_cond = (
-        (pd.notna(pct) and pct >= SENSITIVE_MED_PCT)
-        or (total_sensitive >= SENSITIVE_ITEM_MED)
-        or (unique_users >= UNIQUE_USERS_MED)
-        or (times_accessed >= TIMES_ACCESSED_MED)
-        or external
-    )
+    # 2) Sensitive + external sharing
+    if ((pct_val >= sens_med) or (total_sensitive >= sens_items_med)) and external:
+        score = max(score, 2)
 
-    if med_cond and score < 2:
+    # 3) Large blind spot
+    if high_unscanned:
+        score = max(score, 2)
+
+    # ---------------- MEDIUM conditions ----------------
+    med_sens = (pct_val >= sens_med) or (total_sensitive >= sens_items_med)
+    med_exposed = (unique_users >= users_med) or (times_accessed >= access_med)
+    med_unscanned = (unscan_val >= unscan_med) and (total_items > 0)
+
+    if (med_sens or med_exposed or med_unscanned or external) and score < 2:
         score = max(score, 1)
 
-    # --- Department-based bump --------------------------
+    # ---------------- DeptHint bump ----------------
+    # High departments (HR/Exec/Finance/etc) should *at least* be Medium if they have any content.
     if dept_hint == "High" and total_items > 0:
-        # HR/Exec/Finance/etc → at least Medium
         score = max(score, 1)
     elif dept_hint == "Medium" and total_items > 0:
-        # Important but not obviously critical → at least Medium
         score = max(score, 1)
-    # ----------------------------------------------------
 
+    # ---------------- Final mapping ----------------
     if score <= 0:
         return "Low"
     elif score == 1:
@@ -297,10 +299,10 @@ def classify_row(row) -> str:
 
 def main():
     df = load_assessment(INPUT_FILE)
-    df = add_calculated_columns(df)
-    df["RiskBand"] = df.apply(classify_row, axis=1)
+    df, thresholds = add_calculated_columns_and_thresholds(df)
+    df["RiskBand"] = df.apply(lambda r: classify_row(r, thresholds), axis=1)
 
-    # Optional: bring key columns to the front for readability
+    # Optional: bring key columns to the front
     preferred_order = [
         "Data source ID",
         "Source type",
@@ -324,7 +326,11 @@ def main():
     df = df[cols]
 
     df.to_excel(OUTPUT_FILE, sheet_name="Scored results", index=False)
-    print(f"✔ Done! Output saved to: {OUTPUT_FILE}")
+
+    print("✔ Done! Output saved to:", OUTPUT_FILE)
+    print("Thresholds used:")
+    for k, v in thresholds.items():
+        print(f"  {k}: {v:.4f}")
 
 
 if __name__ == "__main__":
